@@ -5922,8 +5922,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // the reuse decision: only the experts.bin path; a fresh, torn or hash-mismatched file copies as before
-    const bool reuse = arena_reuse && !from_gguf && a->shared_existing && a->shared_complete;
+    // the reuse decision: a fresh, torn or hash-mismatched file copies as before.  The GGUF path qualifies too: it
+    // fills the same packed shared layout, and the pack hash already samples every GGUF source (shared_arena_pack_hash).
+    // Not with STRATA_ARENA_MMAP, which writes experts.bin from the arena it has just loaded.
+    const bool reuse = arena_reuse && !arena_mmap && a->shared_existing && a->shared_complete;
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     LoadStats st;
