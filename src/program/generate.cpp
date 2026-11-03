@@ -259,6 +259,11 @@ bool admit_merge_first_env() {
 // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
 // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
 // overwritten by the copy, so the checkpoints are the same
+// STRATA_PARK_REWIND_MAX=N (opt-in, tokens; unset/0: off): see the request's park decision (rewind_no_park)
+int64_t park_rewind_max() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PARK_REWIND_MAX"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+    return v;
+}
 bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
@@ -14212,6 +14217,27 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            // STRATA_PARK_REWIND_MAX=N (opt-in): a request that resumes from one of the live conversation's OWN checkpoints,
+            // dropping at most N of its tokens, does not park the live conversation first.  That is every agent turn
+            // whose chat template renders the past replies without their reasoning: the prompt matches the live session
+            // up to the checkpoint before the last generation prompt, and the park copied the whole conversation's K/V
+            // to host memory (RTX 3060 host, Flash-Next: 0.3 s at 45K tokens, up to 0.9 s near 200K) only for the next turn to
+            // drop it as superseded.  Nothing else changes: a request for ANOTHER conversation still parks this one's
+            // then-current state, and an exact continuation never parked.  Given up: the dropped tail (the last reply,
+            // at most N tokens) is not kept, so a client that comes back to that exact branch re-reads it.
+            const bool rewind_no_park = [&] {
+                const int64_t mx = park_rewind_max();
+                if (mx <= 0 || from_live || incoming || borrow || slot_source >= 0 || !live_ok || !live_imgs.empty()) return false;
+                if (resume <= 0 || resume > (int64_t) live.size() || (int64_t) live.size() - resume > mx) return false;
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == resume && c.imgs.empty() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                        return true;   // the live conversation's own checkpoint: the request continues it
+                return false;
+            }();
+            if (rewind_no_park)
+                std::fprintf(stderr, "strata serve: conversation cache: not parked (STRATA_PARK_REWIND_MAX): the request "
+                                     "continues the live conversation from its checkpoint at %lld of %zu tokens\n",
+                             (long long) resume, live.size());
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -14234,7 +14260,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !rewind_no_park &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
