@@ -387,10 +387,12 @@ inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
 //    (RTX 3060, 2.5K turns at 48K: a fixed 160 slots read 7% slower than 96, 256 15% slower).  Per layer, the window
 //    (from the pool's first copy to the routing download) and the copy time per expert are measured with events in
 //    every chunk and the next chunk copies window / time-per-expert of them (GDN layers ~10 ms, QSA layers ~45 ms at
-//    48K).  STRATA_PF_AHEAD_FIT=x scales that (default 1.0); 0 copies the full N every layer.
+//    48K).  STRATA_PF_AHEAD_FIT=x (opt-in, experimental) turns that on, scaled by x; unset/0 copies N every layer.
+//    Measured on an RTX 3060 it did not pay yet: the larger QSA-layer pools moved the measured CPU share and its gate,
+//    and the turns read 7-12% slower than a fixed 96 (the share would need a per-layer, pool-aware balance).
 // `auto` = kPfAheadAuto slots.  Unset / 0: off, the walk as before.  Chunks below STRATA_PF_AHEAD_MIN tokens (default
 // 1024) get no pool: their routing is too sparse for the last chunk to predict it.
-constexpr int kPfAheadAuto = 192;
+constexpr int kPfAheadAuto = 96;   // RTX 3060, 2.5K turns at 30-48K: 96 fixed beat 160 / 256 and the fitted pools
 constexpr int kPfAheadMax = 512;
 inline int pf_ahead_slots() {
     static const int v = [] {
@@ -406,7 +408,7 @@ inline int64_t pf_ahead_min() {
     return v;
 }
 inline double pf_ahead_fit() {
-    static const double v = [] { const char* e = std::getenv("STRATA_PF_AHEAD_FIT"); return e ? std::max(0.0, std::atof(e)) : 1.0; }();
+    static const double v = [] { const char* e = std::getenv("STRATA_PF_AHEAD_FIT"); return e ? std::max(0.0, std::atof(e)) : 0.0; }();
     return v;
 }
 // STRATA_PF_AHEAD_SHARE=0 (A/B): the measured CPU share counts the pool's experts as streamed ones, as before
@@ -3414,8 +3416,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         int64_t kv_pending = -1;
+        // STRATA_PF_AHEAD: a staged chunk with the pool stages each streamed-K/V layer just ahead of its pool copies
+        // (pf_issue) instead of one attention layer early on its own stream, where it competed with the walk's copies
+        // (RTX 3060, 2.5K turns: STRATA_KV_PREFETCH=1 alone -4%); streamed chunks (fresh prompts) keep STRATA_KV_PREFETCH
+        const bool pf_chunk = m.pf_n > 0 && !(m.ring > STAGE && T >= stream_all_min() && m.src != nullptr);
         auto kv_prefetch_after = [&](int64_t layer, int64_t ordinal) -> bool {
-            if (!kv_prefetch || p0 <= 0) return true;
+            if (!kv_prefetch || p0 <= 0 || pf_chunk) return true;
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
@@ -3767,7 +3773,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             (void) cudaGetLastError();
             if (ev_ok) m.pf_meas[(size_t) ln] = 0;
-            if (pf_ahead_kv() && !kv_prefetch && p0 > 0 && kv_pending < 0 && core::is_qsa_layer(g, ln)) {
+            if (pf_ahead_kv() && (!kv_prefetch || pf_chunk) && p0 > 0 && kv_pending < 0 && core::is_qsa_layer(g, ln)) {
                 const core::QsaState& kst = ss.qsa_states[qsa_index];   // ln's ordinal: the QSA layers before it
                 if (kst.kv_mode == 1) {
                     strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), kst.host, core::qsa_kv_format(kst),
