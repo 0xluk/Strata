@@ -14811,12 +14811,57 @@ int main(int argc, char** argv) {
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
             // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+            bool refill_async_live = false;          // STRATA_REFILL_ASYNC: `pending` holds the lent slots' refill
+            Clock::time_point refill_async_t0{};
+            int refill_async_windows = 0;
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+            // STRATA_REFILL_ASYNC=1 (opt-in; one GPU, plain arena, no adaptive round in flight): the lent slots' copies
+            // are queued on the refill stream and the first windows start at once.  The lent experts stay non-resident
+            // (the CPU pool computes them, as any miss) until the copies have landed; then they are admitted exactly as
+            // an adaptive round's swaps are (apply_pending: the residency table, its upload), polled before each decode
+            // window.  The adaptive tier starts no round meanwhile (pending is not empty), and the next prompt waits
+            // for them before it lends (apply_pending(true) at the request's start).  Measured on an RTX 3060: 753 lent
+            // slots refill in ~143 ms, which the time to the first token no longer contains.  The prompt's output is
+            // unchanged; the first decode windows may compute a lent expert on the CPU instead of the GPU (other
+            // rounding), as the decode path already does for any miss.
+            static const bool refill_async = [] { const char* v = std::getenv("STRATA_REFILL_ASYNC"); return v != nullptr && v[0] == '1'; }();
             auto refill = [&](std::string& e) -> bool {
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+                if (refill_async && n_parts == 1 && pf_parts.size() == 1 && stages.empty() && pending.empty() &&
+                    !aflipped && adapt_stream != nullptr && adapt_ev != nullptr && !peer.valid() && !src.complement_ready() &&
+                    !refill_blocking() && !refill_parts && !pin_blobs_on()) {
+                    PfPart& p = pf_parts[0];
+                    const strata::core::OnDevice on(p.dev);
+                    for (const auto& [i, slot] : p.lent) {
+                        const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                        if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb, adapt_stream)) {
+                            if (e.empty()) e = "the asynchronous refill has no blob for a lent slot";
+                            return false;
+                        }
+                        srcp->note_async_read(b, nullptr);   // #1237
+                        pending.emplace_back(i, slot);        // admitted by apply_pending once adapt_ev has completed
+                    }
+                    if (cudaEventRecord(adapt_ev, adapt_stream) != cudaSuccess) {
+                        e = "the asynchronous refill's event";
+                        return false;
+                    }
+                    pending_age = 0;
+                    p.lent.clear();
+                    p.lent_chunk = 0;
+                    refill_async_live = true;
+                    refill_async_t0 = Clock::now();
+                    refill_async_windows = 0;
+                    if (trace) {
+                        std::fprintf(stderr, "strata trace: refill of %lld slots queued (STRATA_REFILL_ASYNC) in %.1f ms\n",
+                                     (long long) n_lent, std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                        std::fflush(stderr);
+                    }
+                    return true;
+                }
                 if (n_parts > 1 && !refill_serial) {
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_issue(p, e)) return false;
@@ -16497,7 +16542,18 @@ int main(int argc, char** argv) {
                 const Clock::time_point taw0 = Clock::now();
                 const bool asw_skip = first_window || merged;   // the session's tier choice counts steady decode windows only
                 double asw_wait_ms = 0;
-                if (adapt_nowait()) apply_pending(false);
+                if (refill_async_live) {   // STRATA_REFILL_ASYNC: admit the lent slots once their copies have landed
+                    ++refill_async_windows;
+                    apply_pending(false);
+                    if (pending.empty()) {
+                        refill_async_live = false;
+                        if (trace)
+                            std::fprintf(stderr, "strata trace: asynchronous refill admitted %.1f ms after the prompt, "
+                                                 "before window %d\n", std::chrono::duration<double, std::milli>(
+                                                     Clock::now() - refill_async_t0).count(), refill_async_windows);
+                    }
+                }
+                else if (adapt_nowait()) apply_pending(false);
                 else if (aov && !pending.empty() && !aflipped) {
                     // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
                     // the copies still landing are waited for per layer inside the window (AdaptGate)
