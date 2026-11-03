@@ -14839,6 +14839,7 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            std::vector<int32_t> pf_split_res;   // STRATA_PF_AHEAD: the split's residency (Prefill::set_split_residency)
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -14899,9 +14900,23 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
+                    // STRATA_PF_AHEAD: the CPU/GPU split reads the residency this loan would leave WITHOUT the staged
+                    // walk's prefetch pool: the pool's extra lent experts stay GPU experts (streamed), so the split, and
+                    // with it the prompt's output, is the one without the pool.  One participant only (no layer split).
+                    int32_t first_nom = -1;
+                    if (pf_parts.size() == 1 && strata::prefill::Prefill::pf_pool_in(want_p, srcp != nullptr)) {
+                        const uint64_t nom = strata::prefill::Prefill::bytes_needed_nominal(g, *p.ses, want_p, srcp != nullptr);
+                        first_nom = (int32_t) std::max<int64_t>(first, p.cache->slots() - cache_slots_for(*p.cache, nom));
+                        if (pf_split_res.size() != host_res.size()) pf_split_res.assign(host_res.size(), strata::core::kNotResident);
+                        p.sp->set_split_residency(pf_split_res.data());
+                    } else if (pf_parts.size() == 1) {
+                        p.sp->set_split_residency(nullptr);
+                    }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
+                            if (first_nom >= 0)
+                                pf_split_res[i] = host_res[i] >= first_nom ? strata::core::kNotResident : host_res[i];
                             if (host_res[i] >= first) {
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
                                 host_res[i] = strata::core::kNotResident;
