@@ -409,6 +409,11 @@ inline double pf_ahead_fit() {
     static const double v = [] { const char* e = std::getenv("STRATA_PF_AHEAD_FIT"); return e ? std::max(0.0, std::atof(e)) : 1.0; }();
     return v;
 }
+// STRATA_PF_AHEAD_SHARE=0 (A/B): the measured CPU share counts the pool's experts as streamed ones, as before
+inline bool pf_ahead_share() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_AHEAD_SHARE"); return e == nullptr || e[0] != '0'; }();
+    return v;
+}
 // STRATA_PF_AHEAD_KV=0 (A/B): the streamed K/V stays where it was staged before (on the compute stream, in the layer)
 inline bool pf_ahead_kv() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_AHEAD_KV"); return e == nullptr || e[0] != '0'; }();
@@ -4433,6 +4438,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     double cpu_ms = 0;                    // the thread's time (the measured share)
                     std::future<bool> cpu_fut;
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
+                    int64_t n_pf_share = 0;               // STRATA_PF_AHEAD, measured share: the streamed experts the pool holds
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;                // auto: one-time costs in the window (no reading)
@@ -4659,6 +4665,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
                             int64_t nstream = 0;
+                            const bool pf_share_here = cpu_share_env() < 0.0 && pf_ahead_share() && m.pf_n > 0 &&
+                                                       m.pf_tag == m.pf_chunk_seq * 4096 + l;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
                                 // STRATA_PF_AHEAD: the residency without the pool's lent slots (set_split_residency)
@@ -4668,12 +4676,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
+                                // STRATA_PF_AHEAD, measured share only: an expert the pool holds is the GPU's (its copy
+                                // is made); the share balances the streamed experts it does not hold (fixed shares keep
+                                // the split - and the bits - of the run without the pool)
+                                if (pf_share_here && m.pf_slot[(size_t) e] >= 0) { ++n_pf_share; continue; }
                                 if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
                             const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
-                            const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) nstream));
+                            const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) (nstream - n_pf_share)));
                             n_stream = nstream;
                             // The CPU thread touches no ExpertSource (its blob() counts reads without a lock, and its
                             // calls race with this thread's own blob_stable()/pinned() ones): the pointers are taken
@@ -5716,7 +5728,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.cpu_pend = true;
                             m.pend_cpu_ms = cpu_ms;
                             m.pend_n_cpu = n_cpu;
-                            m.pend_n_gpu = n_stream - n_cpu;
+                            // the GPU's cost per streamed expert it had to copy in this layer (the pool's were
+                            // copied during the attention: counting them made the GPU look cheaper than its next
+                            // expert is, and the share fell below the balance; RTX 3060, 2.5K turns: 0.38 -> 0.26)
+                            m.pend_n_gpu = std::max<int64_t>(1, n_stream - n_cpu - n_pf_share);
                         }
                         stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
                         const int64_t r0c = T * K - rows_cpu;
