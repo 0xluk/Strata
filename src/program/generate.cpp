@@ -259,6 +259,11 @@ bool admit_merge_first_env() {
 // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
 // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
 // overwritten by the copy, so the checkpoints are the same
+// STRATA_PARK_REWIND_MAX=N (opt-in, tokens; unset/0: off): see the request's park decision (rewind_no_park)
+int64_t park_rewind_max() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_PARK_REWIND_MAX"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+    return v;
+}
 bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
@@ -14212,6 +14217,27 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
+            // STRATA_PARK_REWIND_MAX=N (opt-in): a request that resumes from one of the live conversation's OWN checkpoints,
+            // dropping at most N of its tokens, does not park the live conversation first.  That is every agent turn
+            // whose chat template renders the past replies without their reasoning: the prompt matches the live session
+            // up to the checkpoint before the last generation prompt, and the park copied the whole conversation's K/V
+            // to host memory (RTX 3060 host, Flash-Next: 0.3 s at 45K tokens, up to 0.9 s near 200K) only for the next turn to
+            // drop it as superseded.  Nothing else changes: a request for ANOTHER conversation still parks this one's
+            // then-current state, and an exact continuation never parked.  Given up: the dropped tail (the last reply,
+            // at most N tokens) is not kept, so a client that comes back to that exact branch re-reads it.
+            const bool rewind_no_park = [&] {
+                const int64_t mx = park_rewind_max();
+                if (mx <= 0 || from_live || incoming || borrow || slot_source >= 0 || !live_ok || !live_imgs.empty()) return false;
+                if (resume <= 0 || resume > (int64_t) live.size() || (int64_t) live.size() - resume > mx) return false;
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == resume && c.imgs.empty() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                        return true;   // the live conversation's own checkpoint: the request continues it
+                return false;
+            }();
+            if (rewind_no_park)
+                std::fprintf(stderr, "strata serve: conversation cache: not parked (STRATA_PARK_REWIND_MAX): the request "
+                                     "continues the live conversation from its checkpoint at %lld of %zu tokens\n",
+                             (long long) resume, live.size());
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -14234,7 +14260,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !rewind_no_park &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -14811,12 +14837,57 @@ int main(int argc, char** argv) {
             // #340: with several stages every stage's copies go out first (each card on its own link), then each is
             // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+            bool refill_async_live = false;          // STRATA_REFILL_ASYNC: `pending` holds the lent slots' refill
+            Clock::time_point refill_async_t0{};
+            int refill_async_windows = 0;
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+            // STRATA_REFILL_ASYNC=1 (opt-in; one GPU, plain arena, no adaptive round in flight): the lent slots' copies
+            // are queued on the refill stream and the first windows start at once.  The lent experts stay non-resident
+            // (the CPU pool computes them, as any miss) until the copies have landed; then they are admitted exactly as
+            // an adaptive round's swaps are (apply_pending: the residency table, its upload), polled before each decode
+            // window.  The adaptive tier starts no round meanwhile (pending is not empty), and the next prompt waits
+            // for them before it lends (apply_pending(true) at the request's start).  Measured on an RTX 3060: 753 lent
+            // slots refill in ~143 ms, which the time to the first token no longer contains.  The prompt's output is
+            // unchanged; the first decode windows may compute a lent expert on the CPU instead of the GPU (other
+            // rounding), as the decode path already does for any miss.
+            static const bool refill_async = [] { const char* v = std::getenv("STRATA_REFILL_ASYNC"); return v != nullptr && v[0] == '1'; }();
             auto refill = [&](std::string& e) -> bool {
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
                     if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+                if (refill_async && n_parts == 1 && pf_parts.size() == 1 && stages.empty() && pending.empty() &&
+                    !aflipped && adapt_stream != nullptr && adapt_ev != nullptr && !peer.valid() && !src.complement_ready() &&
+                    !refill_blocking() && !refill_parts && !pin_blobs_on()) {
+                    PfPart& p = pf_parts[0];
+                    const strata::core::OnDevice on(p.dev);
+                    for (const auto& [i, slot] : p.lent) {
+                        const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                        if (b == nullptr || !p.cache->fill_slot_queued(slot, b, e, nb, adapt_stream)) {
+                            if (e.empty()) e = "the asynchronous refill has no blob for a lent slot";
+                            return false;
+                        }
+                        srcp->note_async_read(b, nullptr);   // #1237
+                        pending.emplace_back(i, slot);        // admitted by apply_pending once adapt_ev has completed
+                    }
+                    if (cudaEventRecord(adapt_ev, adapt_stream) != cudaSuccess) {
+                        e = "the asynchronous refill's event";
+                        return false;
+                    }
+                    pending_age = 0;
+                    p.lent.clear();
+                    p.lent_chunk = 0;
+                    refill_async_live = true;
+                    refill_async_t0 = Clock::now();
+                    refill_async_windows = 0;
+                    if (trace) {
+                        std::fprintf(stderr, "strata trace: refill of %lld slots queued (STRATA_REFILL_ASYNC) in %.1f ms\n",
+                                     (long long) n_lent, std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                        std::fflush(stderr);
+                    }
+                    return true;
+                }
                 if (n_parts > 1 && !refill_serial) {
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_issue(p, e)) return false;
@@ -14839,6 +14910,7 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            std::vector<int32_t> pf_split_res;   // STRATA_PF_AHEAD: the split's residency (Prefill::set_split_residency)
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -14899,9 +14971,23 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
+                    // STRATA_PF_AHEAD: the CPU/GPU split reads the residency this loan would leave WITHOUT the staged
+                    // walk's prefetch pool: the pool's extra lent experts stay GPU experts (streamed), so the split, and
+                    // with it the prompt's output, is the one without the pool.  One participant only (no layer split).
+                    int32_t first_nom = -1;
+                    if (pf_parts.size() == 1 && strata::prefill::Prefill::pf_pool_in(want_p, srcp != nullptr)) {
+                        const uint64_t nom = strata::prefill::Prefill::bytes_needed_nominal(g, *p.ses, want_p, srcp != nullptr);
+                        first_nom = (int32_t) std::max<int64_t>(first, p.cache->slots() - cache_slots_for(*p.cache, nom));
+                        if (pf_split_res.size() != host_res.size()) pf_split_res.assign(host_res.size(), strata::core::kNotResident);
+                        p.sp->set_split_residency(pf_split_res.data());
+                    } else if (pf_parts.size() == 1) {
+                        p.sp->set_split_residency(nullptr);
+                    }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
+                            if (first_nom >= 0)
+                                pf_split_res[i] = host_res[i] >= first_nom ? strata::core::kNotResident : host_res[i];
                             if (host_res[i] >= first) {
                                 p.lent.emplace_back((int32_t) i, host_res[i]);
                                 host_res[i] = strata::core::kNotResident;
@@ -16482,7 +16568,18 @@ int main(int argc, char** argv) {
                 const Clock::time_point taw0 = Clock::now();
                 const bool asw_skip = first_window || merged;   // the session's tier choice counts steady decode windows only
                 double asw_wait_ms = 0;
-                if (adapt_nowait()) apply_pending(false);
+                if (refill_async_live) {   // STRATA_REFILL_ASYNC: admit the lent slots once their copies have landed
+                    ++refill_async_windows;
+                    apply_pending(false);
+                    if (pending.empty()) {
+                        refill_async_live = false;
+                        if (trace)
+                            std::fprintf(stderr, "strata trace: asynchronous refill admitted %.1f ms after the prompt, "
+                                                 "before window %d\n", std::chrono::duration<double, std::milli>(
+                                                     Clock::now() - refill_async_t0).count(), refill_async_windows);
+                    }
+                }
+                else if (adapt_nowait()) apply_pending(false);
                 else if (aov && !pending.empty() && !aflipped) {
                     // 0.1.43 STRATA_ADAPT_OVERLAP: the tables take the swaps now, exactly where the wait would have ended;
                     // the copies still landing are waited for per layer inside the window (AdaptGate)
