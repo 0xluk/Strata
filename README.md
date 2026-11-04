@@ -1,3 +1,57 @@
+> ## About this fork: Flash-Next on 2× RTX 3060, PCIe 3.0
+>
+> This is the `flashnext-pcie3` branch of a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata). It adds 8 small, opt-in patches for running **Qwen3.8-Flash-Next** as two agents on two consumer GPUs that share one copy of the experts in RAM.
+> - The patches sit on an older upstream base, not on the current `main`.
+> - Everything is turned on by environment variables. With none set, the engine behaves like upstream.
+> - Prefill output is bit-identical and decode is unchanged.
+>
+> **Test box:**
+> - Xeon E5-1650 v3 (Haswell, 6c/12t, AVX2), 96 GB DDR4-2133.
+> - 2× RTX 3060 12 GB at 130 W, PCIe 3.0 x16, no P2P.
+> - Qwen3.8-Flash-Next GSQ-RCO **IQ3_S**; 256K context per agent.
+>
+> | | Upstream base | This branch |
+> |---|---|---|
+> | Decode, 1 agent | 53.3 tok/s | 53.0 tok/s (same, within noise) |
+> | Decode, 2 agents at once (one per GPU) | ~53 + 53 tok/s | ~53 + 52 tok/s |
+> | Decode at ~183K context, 2 agents | 45.8 / 47.7 | 50.5 / 50.3 |
+> | Fresh prompt, 2K / 30K / 165K | 552 / 1,080 / 1,005 tok/s | 644 / 1,112 / 1,040 tok/s |
+> | **Agentic turns** (~2.5K new tokens on 30-48K context) | 512 tok/s, TTFT 4.97 s | **692 tok/s, TTFT 3.67 s (+35%)** |
+> | **Agentic turns at 165-183K** | 449 tok/s | **602 tok/s (+34%)** |
+>
+> **What the patches do**
+> - `STRATA_ARENA_REUSE=1`: a second instance attaches to an already-complete shared expert arena instead of copying ~47 GB again, and GGUF-sourced arenas now qualify.
+> - `STRATA_PF_AHEAD=auto`: prefetches the next layer's experts during staged prefill chunks. Before, PCIe sat idle while each layer waited for its routing.
+> - `STRATA_REFILL_ASYNC=1`: refills lent expert-cache slots in the background instead of before the first token.
+> - `STRATA_PARK_REWIND_MAX=4096`: skips the park/rewind when a request continues the live conversation.
+> - The `auto` CPU share no longer counts prefetched experts as GPU work.
+>
+> Per-commit details and the full A/B are in the merged PR [#2](https://github.com/0xluk/Strata/pull/2), on top of [#1](https://github.com/0xluk/Strata/pull/1).
+>
+> **Setup that matters more than the patches**
+> 1. **All experts in RAM.** With experts mmap'd from disk we got 10-18 tok/s.
+> 2. **One instance per GPU, sharing one arena.** Pass `--shared-expert-arena /path/on/tmpfs/flashnext.arena` to both instances, on a tmpfs with `huge=always`. Two agents need ~62 GB of RAM in total.
+> 3. **Pin each instance to its own half of the cores.**
+>    - Example: `taskset -c 0,1,2,6,7,8` with `--pool-cores 1,2` for instance A, and `taskset -c 3,4,5,9,10,11` with `--pool-cores 4,5` for instance B.
+>    - Unpinned, the two instances fought over the cores: 31 + 33 tok/s. Pinned: 51 + 51.
+> 4. **Engine flags:** `--kv-resident 20480` (KV streaming, so 256K context works on 12 GB cards), `--kv int8`, `--prefill auto`, `--expert-cache auto`, MTP with `--mtp-draft-vocab data/draft_vocab_en.bin`.
+> 5. **Environment:**
+>    ```
+>    STRATA_ARENA_REUSE=1 STRATA_PREFILL_CPU_SHARE=auto STRATA_PREFILL_CPU_SHARE_MAX=4608
+>    STRATA_PF_AHEAD=auto STRATA_REFILL_ASYNC=1 STRATA_PARK_REWIND_MAX=4096
+>    STRATA_KV_PREFETCH=1 STRATA_CKPT_POOL=1 STRATA_CKPT_POOL_READY=4
+>    ```
+>
+> **Not worth it on this hardware:**
+> - `--mmap-experts` (page faults: 10-18 tok/s);
+> - `--slots N` on 12 GB cards;
+> - a layer split across both cards (same decode speed; it serves only one agent);
+> - a bigger CPU (the expert pool is limited by memory bandwidth).
+>
+> Roll back by unsetting the variables; each can be dropped on its own.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
